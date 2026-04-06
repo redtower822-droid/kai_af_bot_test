@@ -18,7 +18,7 @@ if not BOT_TOKEN:
 
 SCHEDULE_URL = "https://docs.google.com/document/u/0/d/1ZjBfEvJzmluiZy-5HqvulPHHfqjYTbxltDp4hbCdZWc/pub"
 GROUP_NAME = "09.03.03"
-VERSION = "2026-04-06-v3"  # авто-версия при каждом моём ответе
+VERSION = "2026-04-06-v5-fixed"
 
 # ---------- КЭШ ----------
 _cache = {"data": None, "expires": 0}
@@ -30,24 +30,28 @@ def get_cached_schedule():
         _cache["expires"] = now + 3600
     return _cache["data"]
 
-def parse_lesson_text(text):
-    if not text or text == "-":
+def clean_text(t):
+    return re.sub(r'\s+', ' ', t).strip()
+
+def parse_lesson(text):
+    """Извлекает предмет, преподавателя, аудиторию из текста ячейки"""
+    if not text or text == '-':
         return None, None, None
+    # Аудитория в скобках в конце
     room = None
-    match_room = re.search(r'\(([^)]+)\)$', text)
-    if match_room:
-        room = match_room.group(1)
-        text = text[:match_room.start()].strip()
+    m = re.search(r'\(([^)]+)\)$', text)
+    if m:
+        room = m.group(1)
+        text = text[:m.start()].strip()
+    # Преподаватель: обычно после должности или в конце с инициалами
     teacher = None
-    parts = text.split()
-    for i, part in enumerate(parts):
-        if re.match(r'[А-Я][а-я]*\.', part) and i < len(parts)-1:
-            teacher = " ".join(parts[i:])
-            text = " ".join(parts[:i]).strip()
-            break
-    if not teacher and len(parts) > 1 and re.match(r'[А-Я][а-я]+\s+[А-Я]\.[А-Я]\.', parts[-1]):
-        teacher = parts[-1]
-        text = " ".join(parts[:-1])
+    # Паттерн: должность (доц., ст.пр., проф.) + Фамилия И.О. или просто Фамилия И.О.
+    match = re.search(r'(доц\.|ст\.пр\.|проф\.|преп\.)\s+([А-Я][а-я]+\s+[А-Я]\.[А-Я]\.?)', text)
+    if not match:
+        match = re.search(r'([А-Я][а-я]+\s+[А-Я]\.[А-Я]\.?)', text)
+    if match:
+        teacher = match.group(0)
+        text = text[:match.start()].strip()
     return text, teacher, room
 
 def load_schedule_from_google():
@@ -55,64 +59,104 @@ def load_schedule_from_google():
     resp = requests.get(SCHEDULE_URL, headers=headers, timeout=15)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, 'html.parser')
-    table = soup.find('table')
+    
+    # Находим таблицу
+    table = soup.find('table', class_='c19')
+    if not table:
+        table = soup.find('table')
     if not table:
         raise ValueError("Таблица не найдена")
+    
     rows = table.find_all('tr')
-    if len(rows) < 3:
-        raise ValueError("Таблица слишком мала")
-    # Определяем колонку для группы 24100 (09.03.03)
-    header_cells = rows[0].find_all(['td', 'th'])
-    target_col = 1  # по умолчанию вторая колонка
-    for idx, cell in enumerate(header_cells):
-        if '24100' in cell.get_text() or '09.03.03' in cell.get_text():
-            target_col = idx
+    # Определяем индекс колонки для группы 24100 (09.03.03)
+    # Заголовок в первой строке (row 0)
+    header_row = rows[0]
+    headers = [clean_text(cell.get_text()) for cell in header_row.find_all(['td', 'th'])]
+    target_col = None
+    for i, h in enumerate(headers):
+        if '24100' in h or '09.03.03' in h:
+            target_col = i
             break
+    if target_col is None:
+        # По умолчанию вторая колонка (индекс 1)
+        target_col = 1
+    
+    # Маппинг дней недели
+    day_names = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота']
+    day_short = {'Понедельник': 'Пн', 'Вторник': 'Вт', 'Среда': 'Ср', 'Четверг': 'Чт', 'Пятница': 'Пт', 'Суббота': 'Сб'}
+    
     schedule = {}
     current_day = None
-    rowspan_left = 0
+    rowspan = 0
+    
+    # Пропускаем первую строку (заголовок)
     for row in rows[1:]:
         cells = row.find_all(['td', 'th'])
         if not cells:
             continue
-        if rowspan_left == 0:
+        
+        # Ячейка дня (первая колонка)
+        if rowspan == 0:
             day_cell = cells[0]
-            current_day = day_cell.get_text(strip=True)
-            current_day = re.sub(r'\s+\d+', '', current_day).strip()
-            rowspan = day_cell.get('rowspan')
-            rowspan_left = int(rowspan) if rowspan and rowspan.isdigit() else 1
+            day_text = clean_text(day_cell.get_text())
+            # Извлекаем название дня без даты
+            for d in day_names:
+                if d in day_text:
+                    current_day = d
+                    break
+            if not current_day:
+                # Если не нашли, берём первое слово
+                current_day = day_text.split()[0]
+            rowspan = int(day_cell.get('rowspan', 1))
             start_col = 1
         else:
-            rowspan_left -= 1
+            rowspan -= 1
             start_col = 0
-        # Ищем время и предмет
+        
+        if not current_day:
+            continue
+        
+        # Теперь ищем время и предмет
+        # Время обычно в первой ячейке после дня (индекс start_col)
+        # Но в некоторых строках время может быть не в первой, а во второй? Нет, в таблице время всегда сразу после дня.
+        # Однако из-за rowspan ячейка дня может отсутствовать, тогда время будет в первой ячейке (индекс 0).
         time_cell = None
         lesson_cell = None
+        # Ищем ячейку с временем (цифры с точкой или двоеточием)
         for i in range(start_col, len(cells)):
-            text = cells[i].get_text(strip=True)
-            if re.match(r'^\d{1,2}\.\d{2}$', text) or re.match(r'^\d{1,2}:\d{2}$', text):
+            cell_text = clean_text(cells[i].get_text())
+            if re.match(r'^\d{1,2}[\.:]\d{2}$', cell_text):
                 time_cell = cells[i]
-                # Предмет для нашей группы — через одну ячейку? Нет, просто берём ячейку с индексом target_col, если она есть
+                # Предмет для нашей группы находится на позиции target_col относительно начала строки?
+                # В каждой строке порядок колонок: день (если есть), время, предмет_24100, время_24200, предмет_24200, ...
+                # Поэтому предмет для 24100 всегда идёт сразу после времени? Нет, после времени идёт предмет для 24100, затем время для 24200 и т.д.
+                # Но из-за того, что target_col может быть больше 1, нужно брать ячейку с индексом target_col, если она есть.
                 if target_col < len(cells):
                     lesson_cell = cells[target_col]
                 break
         if not time_cell or not lesson_cell:
             continue
-        time_str = time_cell.get_text(strip=True)
-        lesson_text = lesson_cell.get_text(strip=True)
+        
+        time_str = clean_text(time_cell.get_text())
+        lesson_text = clean_text(lesson_cell.get_text())
         if not lesson_text or lesson_text == '-':
             continue
-        subject, teacher, room = parse_lesson_text(lesson_text)
+        
+        subject, teacher, room = parse_lesson(lesson_text)
         if not subject:
             subject = lesson_text
-        day_map = {'Понедельник': 'Пн', 'Вторник': 'Вт', 'Среда': 'Ср', 'Четверг': 'Чт', 'Пятница': 'Пт', 'Суббота': 'Сб'}
-        day_short = day_map.get(current_day, current_day[:2])
-        schedule.setdefault(day_short, []).append({
+        
+        day_key = day_short.get(current_day, current_day[:2])
+        schedule.setdefault(day_key, []).append({
             'time': time_str,
             'subject': subject,
             'teacher': teacher,
             'room': room
         })
+    
+    if not schedule:
+        raise ValueError("Не удалось извлечь расписание. Возможно, изменилась структура таблицы.")
+    
     return schedule
 
 def format_schedule_for_day(target_date):
@@ -186,7 +230,7 @@ async def main():
     logging.basicConfig(level=logging.INFO)
     try:
         get_cached_schedule()
-        logging.info("Расписание загружено")
+        logging.info("Расписание загружено успешно")
     except Exception as e:
         logging.error(f"Ошибка при старте: {e}")
     await dp.start_polling(bot)
