@@ -23,23 +23,22 @@ _cache = {
 }
 
 def get_cached_schedule():
-    """Возвращает расписание из кэша или загружает новое, если кэш устарел (1 час)"""
     now = time.time()
     if _cache["data"] is None or now > _cache["expires"]:
         _cache["data"] = load_schedule_from_google()
-        _cache["expires"] = now + 3600  # 1 час
+        _cache["expires"] = now + 3600
     return _cache["data"]
 
 def load_schedule_from_google():
-    """Загружает и парсит расписание из Google Docs. Возвращает (week_schedules, days_names)"""
     try:
-        resp = requests.get(SCHEDULE_URL, timeout=10)
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        resp = requests.get(SCHEDULE_URL, headers=headers, timeout=15)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, 'html.parser')
         tables = soup.find_all('table')
         if len(tables) < 2:
-            # Возможно, таблица одна и внутри неё две части (чёт/нечет) – пробуем распарсить как две
-            # Но для вашего документа точно две таблицы
             raise ValueError(f"Найдено таблиц: {len(tables)}, ожидалось 2")
         
         week_schedules = {}
@@ -50,19 +49,16 @@ def load_schedule_from_google():
             rows = table.find_all('tr')
             if not rows:
                 continue
-            
-            # Заголовок: ищем строку с днями недели
+            # Заголовок
             header_row = rows[0]
             day_cells = header_row.find_all(['td', 'th'])
             days = []
             for cell in day_cells:
                 text = cell.get_text(strip=True)
-                # Игнорируем ячейку "Время" или "Time"
                 if text and text.lower() not in ("время", "time"):
                     days.append(text)
-            
             if idx == 0:
-                days_names = days  # сохраняем названия дней из первой таблицы
+                days_names = days
             
             schedule = {i: {} for i in range(len(days))}
             for row in rows[1:]:
@@ -80,39 +76,36 @@ def load_schedule_from_google():
         
         return week_schedules, days_names
     except Exception as e:
-        logging.error(f"Ошибка парсинга расписания: {e}")
+        logging.error(f"Ошибка парсинга расписания: {e}", exc_info=True)
         raise
 
 # ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
 def get_week_type():
-    """Определяет чётность недели. Начало учебного года: 1 сентября 2025 (нечётная)"""
     start_date = datetime(2025, 9, 1).date()
     today = datetime.now().date()
     delta_days = (today - start_date).days
     if delta_days < 0:
-        return "odd"  # нечётная
+        return "odd"
     week_num = delta_days // 7
     return "odd" if week_num % 2 == 0 else "even"
 
 def get_day_index(weekday):
-    """weekday: 0=пн ... 5=сб"""
     mapping = {0: "Пн", 1: "Вт", 2: "Ср", 3: "Чт", 4: "Пт", 5: "Сб"}
     return mapping.get(weekday)
 
 def format_schedule_for_day(target_date):
-    """Возвращает отформатированное расписание на указанную дату"""
     try:
         week_schedules, days_names = get_cached_schedule()
-    except Exception:
-        return "❌ Не удалось загрузить расписание. Попробуйте позже."
+    except Exception as e:
+        return f"❌ Ошибка загрузки расписания: {str(e)}"
     
     weekday_num = target_date.weekday()
-    if weekday_num > 5:  # воскресенье
+    if weekday_num > 5:
         return "📅 В воскресенье пар нет."
     
     day_name = get_day_index(weekday_num)
     if day_name not in days_names:
-        return "❌ Расписание на этот день не найдено."
+        return f"❌ День {day_name} не найден в расписании. Доступные дни: {', '.join(days_names)}"
     
     day_idx = days_names.index(day_name)
     week_type = get_week_type()
@@ -130,11 +123,10 @@ def format_schedule_for_day(target_date):
     return "\n".join(lines)
 
 def format_full_week():
-    """Возвращает расписание на всю текущую неделю"""
     try:
         week_schedules, days_names = get_cached_schedule()
-    except Exception:
-        return "❌ Не удалось загрузить расписание."
+    except Exception as e:
+        return f"❌ Ошибка загрузки расписания: {str(e)}"
     
     week_type = get_week_type()
     week_schedule = week_schedules[week_type]
@@ -187,7 +179,6 @@ async def week_cmd(message: types.Message):
 
 async def main():
     logging.basicConfig(level=logging.INFO)
-    # Загружаем расписание при старте, чтобы кэш заполнился
     try:
         get_cached_schedule()
         logging.info("Расписание успешно загружено при старте")
@@ -195,7 +186,7 @@ async def main():
         logging.error(f"Не удалось загрузить расписание при старте: {e}")
     await dp.start_polling(bot)
 
-# ---------- ВЕБ-СЕРВЕР ДЛЯ ПИНГОВ (чтобы бот не засыпал) ----------
+# ---------- ВЕБ-СЕРВЕР ДЛЯ ПИНГОВ ----------
 from flask import Flask
 from threading import Thread
 
@@ -215,5 +206,5 @@ def keep_alive():
 
 # ---------- ЗАПУСК ----------
 if __name__ == "__main__":
-    keep_alive()   # запускаем веб-сервер в фоне
+    keep_alive()
     asyncio.run(main())
