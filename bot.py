@@ -17,7 +17,7 @@ if not BOT_TOKEN:
 
 SCHEDULE_URL = "https://docs.google.com/document/u/0/d/1ZjBfEvJzmluiZy-5HqvulPHHfqjYTbxltDp4hbCdZWc/pub"
 GROUP_NAME = "09.03.03"
-VERSION = "2026-04-06-v10"
+VERSION = "2026-04-06-v14"
 
 _cache = {"data": None, "expires": 0}
 
@@ -29,13 +29,16 @@ def get_cached_schedule():
     return _cache["data"]
 
 def parse_lesson(text):
+    """Извлекает предмет, преподавателя, аудиторию."""
     if not text or text == '-':
         return None, None, None
+    # Аудитория в скобках
     room = None
     m = re.search(r'\(([^)]+)\)$', text)
     if m:
         room = m.group(1)
         text = text[:m.start()].strip()
+    # Преподаватель
     teacher = None
     match = re.search(r'(доц\.|ст\.пр\.|проф\.|преп\.)\s+([А-Я][а-я]+\s+[А-Я]\.[А-Я]\.?)', text)
     if not match:
@@ -55,7 +58,7 @@ def load_schedule_from_google():
     if not table:
         raise ValueError("Таблица не найдена")
     rows = table.find_all('tr')
-    # Определяем колонку для группы 24100 (индекс заголовка)
+    # Определяем колонку для группы 24100 (09.03.03)
     header_row = rows[0]
     header_cells = header_row.find_all(['td', 'th'])
     target_col = None
@@ -64,82 +67,63 @@ def load_schedule_from_google():
             target_col = idx
             break
     if target_col is None:
-        target_col = 1  # вторая колонка
-    logging.info(f"Колонка группы 24100: {target_col}")
+        target_col = 2  # по умолчанию третья колонка (индекс 2)
+    logging.info(f"Колонка для 24100: {target_col}")
 
+    # Маппинг дней
+    day_names = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота']
     day_short = {'Понедельник': 'Пн', 'Вторник': 'Вт', 'Среда': 'Ср', 'Четверг': 'Чт', 'Пятница': 'Пт', 'Суббота': 'Сб'}
     schedule = {}
     current_day = None
-    rowspan_left = 0
+    rowspan = 0
 
-    # Перебираем все строки, начиная со второй (индекс 1)
     for row in rows[1:]:
         cells = row.find_all(['td', 'th'])
         if not cells:
             continue
-
-        # Проверяем, есть ли в этой строке ячейка дня (первая ячейка)
-        if rowspan_left == 0:
-            # Это строка, которая начинается с дня
+        # Определяем, есть ли в строке день
+        if rowspan == 0:
+            # Новая строка с днём
             day_cell = cells[0]
             day_text = day_cell.get_text(strip=True)
-            # Извлекаем название дня (до числа)
-            for d in day_short.keys():
+            for d in day_names:
                 if d in day_text:
                     current_day = d
                     break
             if not current_day:
-                # Если не нашли, берём первое слово
                 current_day = day_text.split()[0]
-            rowspan = day_cell.get('rowspan')
-            rowspan_left = int(rowspan) if rowspan and rowspan.isdigit() else 1
-            # В этой строке после дня идут ячейки: время, предмет_24100, время_24200, предмет_24200, ...
-            # Индекс времени = 1
+            rowspan = int(day_cell.get('rowspan', 1))
+            # В такой строке индекс времени = 1
             time_idx = 1
+            # Индекс предмета = target_col
+            lesson_idx = target_col
         else:
-            # Это продолжение предыдущего дня (rowspan ещё активен)
-            rowspan_left -= 1
-            # В таких строках нет ячейки дня, первая ячейка — время
+            # Продолжение предыдущего дня
+            rowspan -= 1
             time_idx = 0
+            # В строках без дня колонка дня отсутствует, поэтому предмет смещается на 1 влево
+            lesson_idx = target_col - 1 if target_col > 0 else 0
 
         if not current_day:
             continue
 
-        # Проверяем, есть ли ячейка с временем по индексу time_idx
-        if time_idx >= len(cells):
+        # Проверяем наличие ячеек
+        if time_idx >= len(cells) or lesson_idx >= len(cells):
             continue
+
         time_cell = cells[time_idx]
         time_str = time_cell.get_text(strip=True)
+        # Проверка формата времени
         if not re.match(r'^\d{1,2}\.\d{2}$', time_str):
-            # Не похоже на время — пропускаем
             continue
 
-        # Теперь ищем предмет для нашей группы
-        # Предмет находится в колонке target_col (относительно начала строки)
-        # Но если target_col < time_idx, то предмет может быть раньше времени? Нет, в таблице порядок: [день], время, предмет_24100, ...
-        # Поэтому предмет всегда идёт после времени.
-        # Найдём индекс ячейки предмета: если time_idx=1, то предмет = time_idx+1 = 2? Нет, в первой строке дня: день, время, предмет_24100, ...
-        # Значит, предмет = time_idx + 1? Но target_col может быть больше, если в строке несколько временных ячеек.
-        # Проще: ищем ячейку с индексом target_col. В первой строке дня target_col=2 (т.к. 0-день, 1-время, 2-предмет_24100).
-        # В последующих строках (без дня) target_col=1 (0-время, 1-предмет_24100). Поэтому нужно корректировать target_col в зависимости от наличия дня.
-        # Сделаем так: если в строке есть день (rowspan_left > 0? нет, мы уже уменьшили), но мы знаем, что если time_idx == 1, то день присутствовал, и target_col должен быть на 1 больше.
-        # Упростим: будем искать предмет в ячейке с индексом target_col, но если target_col >= len(cells), то предмета нет.
-        # Однако из-за того, что в строках без дня количество ячеек меньше, target_col может быть сдвинут.
-        # Лучше: определим, сколько колонок в строке, и возьмём последнюю доступную ячейку, если target_col выходит за пределы.
-        lesson_idx = target_col
-        if time_idx == 0 and target_col == 2:
-            # В строках без дня первая ячейка — время, вторая — предмет_24100 (индекс 1)
-            lesson_idx = 1
-        elif time_idx == 1 and target_col == 2:
-            lesson_idx = 2
-        else:
-            lesson_idx = target_col
-
-        if lesson_idx >= len(cells):
-            continue
         lesson_cell = cells[lesson_idx]
         lesson_text = lesson_cell.get_text(strip=True)
         if not lesson_text or lesson_text == '-':
+            continue
+
+        # Пропускаем строки, где предмет совпадает со временем (например "8.15")
+        if lesson_text == time_str:
             continue
 
         subject, teacher, room = parse_lesson(lesson_text)
@@ -154,7 +138,7 @@ def load_schedule_from_google():
             'room': room
         })
 
-    # Удаляем дубликаты
+    # Удаляем дубликаты (если одинаковое время и предмет)
     for day in schedule:
         unique = []
         seen = set()
@@ -166,8 +150,9 @@ def load_schedule_from_google():
         schedule[day] = unique
 
     # Логируем результат
-    for day, lessons in schedule.items():
-        logging.info(f"День {day}: {len(lessons)} пар")
+    for day in ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб']:
+        count = len(schedule.get(day, []))
+        logging.info(f"{day}: {count} пар")
     if not schedule:
         raise ValueError("Расписание не извлечено")
     return schedule
