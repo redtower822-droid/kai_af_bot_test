@@ -12,16 +12,29 @@ from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 
+# Попробуем импортировать requests_html для рендеринга JS
+try:
+    from requests_html import HTMLSession
+    HAS_HTML_SESSION = True
+except ImportError:
+    HAS_HTML_SESSION = False
+    logging.warning("requests_html не установлен, рендеринг JS недоступен")
+
+# ---------- Конфигурация ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не задан")
 
-API_URL = "https://para.alf-kai.ru/?q=24100"
-FALLBACK_URL = "https://alf-kai.ru/расписание/"
+# Источники (можно переключать)
+GOOGLE_DOC_URL = "https://docs.google.com/document/u/0/d/1ZjBfEvJzmluiZy-5HqvulPHHfqjYTbxltDp4hbCdZWc/pub"
+ALF_API_URL = "https://para.alf-kai.ru/?q=24100"
+ALF_HTML_URL = "https://alf-kai.ru/расписание/"
+
 GROUP_VARIANTS = ["24100", "09.03.03"]
 SEMESTER_START = datetime(2026, 2, 9)
-VERSION = "2026-04-08-improved-html"
+VERSION = "2026-04-08-debug-v2"
 
+# ---------- Кэш ----------
 _cache = {"data": None, "expires": 0}
 
 def get_cached_schedule():
@@ -31,120 +44,108 @@ def get_cached_schedule():
         _cache["expires"] = now + 3600
     return _cache["data"]
 
+# ---------- Универсальная загрузка ----------
 def load_schedule():
-    # Попытка через API
+    # 1. Пробуем Google Docs
     try:
-        resp = requests.get(API_URL, timeout=10)
-        resp.raise_for_status()
-        if 'application/json' in resp.headers.get('content-type', ''):
-            data = resp.json()
-            return parse_api_json(data)
-        else:
-            logging.warning("API вернул HTML, пробуем парсить как HTML")
-            return parse_html(resp.text)
+        logging.info("Пробуем загрузить Google Doc...")
+        return parse_google_doc()
     except Exception as e:
-        logging.error(f"Ошибка API: {e}")
+        logging.error(f"Google Doc ошибка: {e}")
 
-    # Fallback на основную страницу
+    # 2. Пробуем alf-kai через requests_html (если есть)
+    if HAS_HTML_SESSION:
+        try:
+            logging.info("Пробуем загрузить alf-kai.ru с рендерингом JS...")
+            return parse_alf_with_js()
+        except Exception as e:
+            logging.error(f"alf-kai JS ошибка: {e}")
+
+    # 3. Fallback на статический HTML alf-kai
     try:
-        resp = requests.get(FALLBACK_URL, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15)
-        resp.raise_for_status()
-        return parse_html(resp.text)
+        logging.info("Пробуем статический HTML alf-kai.ru...")
+        return parse_alf_html()
     except Exception as e:
-        logging.error(f"Ошибка fallback: {e}")
-        raise ValueError("Не удалось загрузить расписание ни через API, ни через HTML")
+        logging.error(f"alf-kai HTML ошибка: {e}")
 
-def parse_api_json(data):
-    day_map = {
-        "Понедельник": "Пн", "Вторник": "Вт", "Среда": "Ср",
-        "Четверг": "Чт", "Пятница": "Пт", "Суббота": "Сб", "Воскресенье": "Вс"
-    }
-    schedule = {}
-    for rus_day, lessons in data.items():
-        short_day = day_map.get(rus_day, rus_day[:2])
-        if not lessons:
-            schedule[short_day] = []
-            continue
-        parsed = []
-        for item in lessons:
-            time_str = item.get("time", "").strip()
-            subject = item.get("subject", "").strip()
-            teacher = item.get("teacher", "").strip()
-            room = item.get("room", "").strip()
-            if subject and subject != "-":
-                parsed.append({
-                    "time": time_str,
-                    "subject": subject,
-                    "teacher": teacher or None,
-                    "room": room or None
-                })
-        parsed.sort(key=lambda x: x["time"])
-        schedule[short_day] = parsed
-    if not schedule:
-        raise ValueError("API JSON пуст")
-    return schedule
+    raise ValueError("Все источники не дали результата")
 
-def parse_html(html):
-    soup = BeautifulSoup(html, 'html.parser')
-    tables = soup.find_all('table')
-    logging.info(f"Найдено таблиц: {len(tables)}")
+# ---------- Парсинг Google Doc ----------
+def parse_google_doc():
+    resp = requests.get(GOOGLE_DOC_URL, timeout=15)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, 'html.parser')
+    table = soup.find('table')
+    if not table:
+        raise ValueError("Google Doc: таблица не найдена")
+    return parse_html_table(str(table), source="google_doc")
+
+# ---------- Парсинг alf-kai с JS (requests_html) ----------
+def parse_alf_with_js():
+    session = HTMLSession()
+    r = session.get(ALF_HTML_URL)
+    # Ждём выполнения JavaScript (увеличьте при необходимости)
+    r.html.render(timeout=20, sleep=3)
+    # Ищем таблицу
+    tables = r.html.find('table')
     if not tables:
-        raise ValueError("HTML не содержит таблиц")
-
-    # Поиск целевой таблицы (предположительно, расписание - это большая таблица с днями)
-    # Выведем первые несколько строк каждой таблицы для диагностики
-    target_table = None
+        raise ValueError("После рендеринга таблиц не найдено")
+    # Выбираем нужную таблицу (обычно с расписанием)
+    # Логируем количество и первые строки
     for i, tbl in enumerate(tables):
-        rows = tbl.find_all('tr')
-        if len(rows) < 5:
-            continue
-        # Посмотрим текст первой строки
-        first_row_text = rows[0].get_text()
-        logging.info(f"Таблица {i}: первые 100 символов: {first_row_text[:100]}")
-        # Если есть дни недели или "24100", это наша таблица
-        if any(day in first_row_text for day in ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота']):
-            target_table = tbl
-            break
-        if any(variant in first_row_text for variant in GROUP_VARIANTS):
-            target_table = tbl
-            break
+        logging.info(f"Таблица {i}: {tbl.html[:200]}")
+    target_html = tables[0].html  # первая попавшаяся
+    return parse_html_table(target_html, source="alf_js")
 
-    if not target_table:
-        # Берём самую большую таблицу по числу строк
-        target_table = max(tables, key=lambda t: len(t.find_all('tr')), default=None)
-        if not target_table:
-            raise ValueError("Не найдена подходящая таблица")
-        logging.info("Используем самую большую таблицу")
+# ---------- Парсинг статического HTML alf-kai ----------
+def parse_alf_html():
+    resp = requests.get(ALF_HTML_URL, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, 'html.parser')
+    tables = soup.find_all('table')
+    if not tables:
+        raise ValueError("alf-kai HTML: таблиц нет")
+    # Логируем все таблицы для анализа
+    for i, tbl in enumerate(tables):
+        # Проверяем наличие дней недели в таблице
+        tbl_text = tbl.get_text()
+        if any(day in tbl_text for day in ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница']):
+            logging.info(f"Найдена таблица с днями недели (индекс {i})")
+            return parse_html_table(str(tbl), source="alf_html")
+    raise ValueError("Не найдена таблица с днями недели")
 
-    rows = target_table.find_all('tr')
+# ---------- Общий парсер HTML таблицы ----------
+def parse_html_table(html, source=""):
+    soup = BeautifulSoup(html, 'html.parser')
+    rows = soup.find_all('tr')
     if len(rows) < 2:
-        raise ValueError("В таблице недостаточно строк")
+        raise ValueError(f"{source}: мало строк в таблице")
 
-    # Ищем колонку группы, сканируя первые несколько строк
+    # Логируем шапку для отладки
+    header_row = rows[0]
+    header_cells = header_row.find_all(['td', 'th'])
+    header_texts = [cell.get_text(strip=True) for cell in header_cells]
+    logging.info(f"{source} шапка: {header_texts}")
+
+    # Поиск колонки группы
     target_col = None
-    # Сначала в шапке (первые 3 строки)
-    for row in rows[:3]:
-        cells = row.find_all(['td', 'th'])
-        for idx, cell in enumerate(cells):
-            cell_text = cell.get_text(strip=True)
-            for variant in GROUP_VARIANTS:
-                if variant in cell_text:
-                    target_col = idx
-                    break
-            if target_col is not None:
+    for idx, text in enumerate(header_texts):
+        for variant in GROUP_VARIANTS:
+            if variant in text:
+                target_col = idx
                 break
         if target_col is not None:
             break
 
     if target_col is None:
-        # По умолчанию третья колонка (индекс 2)
-        if len(rows[0].find_all(['td', 'th'])) >= 3:
+        # Попробуем угадать: часто колонка группы третья (индекс 2)
+        if len(header_cells) >= 3:
             target_col = 2
-            logging.warning(f"Колонка группы не найдена, используется индекс {target_col}")
+            logging.warning(f"{source}: колонка группы не найдена, берём индекс 2")
         else:
-            raise ValueError("Не удалось определить колонку группы")
+            raise ValueError(f"{source}: не удалось определить колонку группы")
 
-    logging.info(f"Используется колонка {target_col}")
+    logging.info(f"{source}: целевая колонка = {target_col}")
 
     day_names = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота']
     day_short = {'Понедельник': 'Пн', 'Вторник': 'Вт', 'Среда': 'Ср',
@@ -159,6 +160,7 @@ def parse_html(html):
         if not cells:
             continue
 
+        # Обработка rowspan
         if rowspan_rem == 0:
             day_cell = cells[0]
             day_text = day_cell.get_text(strip=True)
@@ -167,10 +169,18 @@ def parse_html(html):
                     current_day = d
                     break
             if not current_day:
-                continue
-            rowspan_rem = int(day_cell.get('rowspan', 1))
-            time_idx = 1
-            lesson_idx = target_col
+                # Если день не распознан, возможно, это строка продолжения без rowspan?
+                # Пробуем использовать предыдущий день
+                if current_day is None:
+                    continue
+                # Если current_day уже есть, считаем что это продолжение без rowspan
+                time_idx = 0
+                lesson_idx = target_col - 1 if target_col > 0 else 0
+                rowspan_rem = 0
+            else:
+                rowspan_rem = int(day_cell.get('rowspan', 1))
+                time_idx = 1
+                lesson_idx = target_col
         else:
             rowspan_rem -= 1
             time_idx = 0
@@ -215,7 +225,7 @@ def parse_html(html):
         schedule[day] = sorted(unique, key=lambda x: x['time'])
 
     if not schedule:
-        raise ValueError("После парсинга расписание пустое")
+        raise ValueError(f"{source}: расписание пустое")
     return schedule
 
 def parse_lesson_text(text):
@@ -234,11 +244,13 @@ def parse_lesson_text(text):
         text = text[:match.start()].strip()
     return text or "Без названия", teacher, room
 
+# ---------- Чётность недели ----------
 def get_week_parity(date):
     delta = date - SEMESTER_START.date()
     week_number = delta.days // 7 + 1
     return "нечётная" if week_number % 2 == 1 else "чётная"
 
+# ---------- Форматирование ----------
 def format_schedule_for_day(target_date):
     try:
         schedule = get_cached_schedule()
@@ -290,14 +302,14 @@ def format_full_week():
             result += "\n"
     return result
 
-# Telegram Bot
+# ---------- Telegram Bot ----------
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
     await message.answer(
-        f"👋 Привет! Я бот расписания для группы 24100 (09.03.03).\n"
+        f"👋 Привет! Я бот расписания для группы {GROUP_VARIANTS[0]}.\n"
         f"Версия: {VERSION}\n\n"
         "Команды:\n"
         "/today – сегодня\n"
@@ -317,7 +329,7 @@ async def tomorrow_cmd(message: types.Message):
 async def week_cmd(message: types.Message):
     await message.answer(format_full_week())
 
-# Web server
+# ---------- Веб-сервер ----------
 async def handle_health(request):
     return web.Response(text=f"Bot is running. Version: {VERSION}")
 
