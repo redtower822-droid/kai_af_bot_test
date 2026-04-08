@@ -7,8 +7,6 @@ from datetime import datetime, timedelta
 
 import aiohttp
 from aiohttp import web
-import requests
-from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 
@@ -17,10 +15,11 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не задан")
 
-SCHEDULE_URL = "https://docs.google.com/document/u/0/d/1ZjBfEvJzmluiZy-5HqvulPHHfqjYTbxltDp4hbCdZWc/pub"
-GROUP_VARIANTS = ["24100", "09.03.03"]   # возможные варианты написания группы в шапке
-SEMESTER_START = datetime(2026, 2, 9)    # начало семестра (понедельник, нечётная неделя)
-VERSION = "2026-04-08-fixed"
+API_URL = "https://para.alf-kai.ru/?q=24100"           # основной источник
+FALLBACK_URL = "https://alf-kai.ru/расписание/#old_rasp"  # если API упадёт (парсим HTML)
+GROUP_NAME = "24100 (09.03.03)"
+SEMESTER_START = datetime(2026, 2, 9)   # начало семестра (понедельник, нечётная неделя)
+VERSION = "2026-04-08-alf-api"
 
 # ---------- Кэш ----------
 _cache = {"data": None, "expires": 0}
@@ -28,90 +27,112 @@ _cache = {"data": None, "expires": 0}
 def get_cached_schedule():
     now = time.time()
     if _cache["data"] is None or now > _cache["expires"]:
-        _cache["data"] = load_schedule_from_google()
+        _cache["data"] = load_schedule_from_api()
         _cache["expires"] = now + 3600
     return _cache["data"]
 
-# ---------- Парсинг строки занятия ----------
-def parse_lesson(text):
-    """Извлекает предмет, преподавателя и аудиторию."""
-    if not text or text.strip() == '-':
-        return None, None, None
+# ---------- Загрузка через API ----------
+def load_schedule_from_api():
+    """Получает расписание с para.alf-kai.ru в формате JSON."""
+    import requests
+    try:
+        resp = requests.get(API_URL, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        logging.error(f"Ошибка API: {e}, пробуем парсинг HTML")
+        return load_schedule_from_html_fallback()
 
-    # Очищаем от лишних пробелов
-    text = re.sub(r'\s+', ' ', text.strip())
+    # Маппинг русских дней в краткие обозначения
+    day_map = {
+        "Понедельник": "Пн",
+        "Вторник": "Вт",
+        "Среда": "Ср",
+        "Четверг": "Чт",
+        "Пятница": "Пт",
+        "Суббота": "Сб",
+        "Воскресенье": "Вс"
+    }
+    schedule = {}
+    for rus_day, lessons in data.items():
+        short_day = day_map.get(rus_day, rus_day[:2])
+        if not lessons:
+            schedule[short_day] = []
+            continue
+        parsed = []
+        for item in lessons:
+            # Приводим к единому формату
+            time_str = item.get("time", "").strip()
+            subject = item.get("subject", "").strip()
+            teacher = item.get("teacher", "").strip()
+            room = item.get("room", "").strip()
 
-    # Аудитория в скобках (может быть в конце)
-    room = None
-    m = re.search(r'\(([^)]+)\)$', text)
-    if m:
-        room = m.group(1).strip()
-        text = text[:m.start()].strip()
+            if not subject or subject == "-":
+                continue
 
-    # Преподаватель: звание (опционально) + Фамилия И.О.
-    teacher_pattern = r'(?:доц\.|ст\.пр\.|проф\.|преп\.|асс\.)?\s*([А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?\s+[А-ЯЁ]\.[А-ЯЁ]\.)'
-    match = re.search(teacher_pattern, text, re.IGNORECASE)
-    if match:
-        teacher = match.group(0).strip()
-        # Убираем преподавателя из текста предмета
-        text = text[:match.start()].strip()
-    else:
-        teacher = None
+            parsed.append({
+                "time": time_str,
+                "subject": subject,
+                "teacher": teacher if teacher else None,
+                "room": room if room else None
+            })
+        # Сортируем по времени
+        parsed.sort(key=lambda x: x["time"])
+        schedule[short_day] = parsed
 
-    # Оставшееся — предмет (может содержать номер пары или доп. инфу, оставляем как есть)
-    subject = text or "Без названия"
-    return subject, teacher, room
+    # Логирование
+    for day in ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб"]:
+        cnt = len(schedule.get(day, []))
+        logging.info(f"{day}: {cnt} пар")
+    if not schedule:
+        raise ValueError("API вернул пустое расписание")
+    return schedule
 
-# ---------- Загрузка расписания из Google Docs ----------
-def load_schedule_from_google():
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    resp = requests.get(SCHEDULE_URL, headers=headers, timeout=15)
+# ---------- Fallback: парсинг HTML с alf-kai.ru (если API недоступен) ----------
+def load_schedule_from_html_fallback():
+    import requests
+    from bs4 import BeautifulSoup
+
+    url = "https://alf-kai.ru/расписание/"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    resp = requests.get(url, headers=headers, timeout=15)
     resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, 'html.parser')
-    table = soup.find('table')
-    if not table:
-        raise ValueError("Таблица не найдена")
+    soup = BeautifulSoup(resp.text, "html.parser")
 
-    rows = table.find_all('tr')
+    # Ищем таблицу с расписанием (обычно это первая большая таблица)
+    table = soup.find("table")
+    if not table:
+        raise ValueError("HTML fallback: таблица не найдена")
+
+    rows = table.find_all("tr")
     if len(rows) < 2:
         raise ValueError("Слишком мало строк в таблице")
 
-    # Ищем целевую колонку по вариантам группы
-    header_row = rows[0]
-    header_cells = header_row.find_all(['td', 'th'])
+    # Ищем колонку для группы 24100
+    header_cells = rows[0].find_all(["td", "th"])
     target_col = None
     for idx, cell in enumerate(header_cells):
-        cell_text = cell.get_text(strip=True)
-        for variant in GROUP_VARIANTS:
-            if variant in cell_text:
-                target_col = idx
-                break
-        if target_col is not None:
+        if "24100" in cell.get_text() or "09.03.03" in cell.get_text():
+            target_col = idx
             break
-
     if target_col is None:
-        target_col = 2  # fallback
-        logging.warning("Колонка группы не найдена, используется индекс 2 (третья)")
+        target_col = 2
+        logging.warning("Колонка группы не найдена, fallback index=2")
 
-    logging.info(f"Колонка для группы: {target_col}")
-
-    # Маппинг дней
-    day_names = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота']
-    day_short = {'Понедельник': 'Пн', 'Вторник': 'Вт', 'Среда': 'Ср',
-                 'Четверг': 'Чт', 'Пятница': 'Пт', 'Суббота': 'Сб'}
+    day_names = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота"]
+    day_short = {"Понедельник": "Пн", "Вторник": "Вт", "Среда": "Ср",
+                 "Четверг": "Чт", "Пятница": "Пт", "Суббота": "Сб"}
 
     schedule = {}
     current_day = None
-    rowspan_remaining = 0
+    rowspan_rem = 0
 
     for row in rows[1:]:
-        cells = row.find_all(['td', 'th'])
+        cells = row.find_all(["td", "th"])
         if not cells:
             continue
 
-        # Определяем, новая ли это строка с днём
-        if rowspan_remaining == 0:
-            # Первая ячейка — день
+        if rowspan_rem == 0:
             day_cell = cells[0]
             day_text = day_cell.get_text(strip=True)
             for d in day_names:
@@ -119,99 +140,90 @@ def load_schedule_from_google():
                     current_day = d
                     break
             if not current_day:
-                # Если день не распознан, пропускаем
                 continue
-            rowspan_remaining = int(day_cell.get('rowspan', 1))
-            time_idx = 1          # вторая ячейка — время
+            rowspan_rem = int(day_cell.get("rowspan", 1))
+            time_idx = 1
             lesson_idx = target_col
         else:
-            rowspan_remaining -= 1
-            time_idx = 0          # время в первой ячейке (дня нет)
-            # В таких строках колонка дня отсутствует, сдвиг на 1 влево
+            rowspan_rem -= 1
+            time_idx = 0
             lesson_idx = target_col - 1 if target_col > 0 else 0
 
-        # Проверка наличия нужных ячеек
         if time_idx >= len(cells) or lesson_idx >= len(cells):
             continue
 
         time_cell = cells[time_idx]
         time_str = time_cell.get_text(strip=True)
-        if not re.match(r'^\d{1,2}\.\d{2}$', time_str):
-            continue  # пропускаем строки без времени
+        if not re.match(r"^\d{1,2}\.\d{2}$", time_str):
+            continue
 
         lesson_cell = cells[lesson_idx]
         lesson_text = lesson_cell.get_text(strip=True)
-        if not lesson_text or lesson_text == '-':
+        if not lesson_text or lesson_text == "-":
             continue
 
-        # Иногда время дублируется в ячейке предмета, пропускаем
-        if lesson_text == time_str:
-            continue
+        # Парсим занятие (упрощённо)
+        subject, teacher, room = parse_lesson_text(lesson_text)
+        if not subject:
+            subject = lesson_text
 
-        # Может быть несколько занятий через запятую или перенос строки
-        # Разделяем по запятой или точке с запятой, но с учётом возможных внутренних запятых в названии
-        # Упрощённо — разделяем по запятой, если после неё идёт время или аудитория
-        parts = [lesson_text]
-        if ',' in lesson_text:
-            # Попытка разделить, но осторожно (может быть "Математика, лекция")
-            # Лучше не делить — в нашем случае обычно одно занятие в ячейке
-            pass
+        day_key = day_short.get(current_day, current_day[:2])
+        schedule.setdefault(day_key, []).append({
+            "time": time_str,
+            "subject": subject,
+            "teacher": teacher,
+            "room": room
+        })
 
-        for part in parts:
-            part = part.strip()
-            if not part:
-                continue
-            subject, teacher, room = parse_lesson(part)
-            if subject is None:
-                subject = part
-
-            day_key = day_short.get(current_day, current_day[:2])
-            schedule.setdefault(day_key, []).append({
-                'time': time_str,
-                'subject': subject,
-                'teacher': teacher,
-                'room': room
-            })
-
-    # Удаление дубликатов (одинаковое время + предмет в один день)
+    # Удаление дубликатов
     for day in schedule:
         unique = []
         seen = set()
         for item in schedule[day]:
-            key = (item['time'], item['subject'])
+            key = (item["time"], item["subject"])
             if key not in seen:
                 seen.add(key)
                 unique.append(item)
-        schedule[day] = sorted(unique, key=lambda x: x['time'])
-
-    # Логирование итогов
-    for day in ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб']:
-        cnt = len(schedule.get(day, []))
-        logging.info(f"{day}: {cnt} пар")
+        schedule[day] = sorted(unique, key=lambda x: x["time"])
 
     if not schedule:
-        raise ValueError("Расписание пустое — проверьте URL и колонку")
-
+        raise ValueError("HTML fallback: расписание пустое")
     return schedule
 
-# ---------- Определение чётности недели ----------
+def parse_lesson_text(text):
+    """Вспомогательная функция для fallback-парсинга."""
+    if not text:
+        return None, None, None
+    text = re.sub(r"\s+", " ", text.strip())
+    room = None
+    m = re.search(r"\(([^)]+)\)$", text)
+    if m:
+        room = m.group(1).strip()
+        text = text[:m.start()].strip()
+    teacher = None
+    match = re.search(r"(?:доц\.|ст\.пр\.|проф\.|преп\.)?\s*([А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?\s+[А-ЯЁ]\.[А-ЯЁ]\.)", text, re.I)
+    if match:
+        teacher = match.group(0).strip()
+        text = text[:match.start()].strip()
+    return text or "Без названия", teacher, room
+
+# ---------- Чётность недели ----------
 def get_week_parity(date: datetime.date) -> str:
-    """Возвращает 'нечётная' или 'чётная'."""
     delta = date - SEMESTER_START.date()
     week_number = delta.days // 7 + 1
     return "нечётная" if week_number % 2 == 1 else "чётная"
 
-# ---------- Форматирование расписания на день ----------
+# ---------- Форматирование ----------
 def format_schedule_for_day(target_date):
     try:
         schedule = get_cached_schedule()
     except Exception as e:
-        logging.exception("Ошибка загрузки расписания")
-        return f"❌ Ошибка загрузки: {e}"
+        logging.exception("Ошибка загрузки")
+        return f"❌ Ошибка загрузки расписания: {e}"
 
-    weekdays = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс']
+    weekdays = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
     day_name = weekdays[target_date.weekday()]
-    if day_name == 'Вс':
+    if day_name == "Вс":
         return "📅 В воскресенье пар нет."
 
     lessons = schedule.get(day_name, [])
@@ -223,8 +235,8 @@ def format_schedule_for_day(target_date):
 
     lines = [header]
     for l in lessons:
-        room_str = f" в {l['room']}" if l['room'] else ""
-        teacher_str = f"\n👨‍🏫 {l['teacher']}" if l['teacher'] else ""
+        room_str = f" в {l['room']}" if l.get("room") else ""
+        teacher_str = f"\n👨‍🏫 {l['teacher']}" if l.get("teacher") else ""
         lines.append(f"🕒 {l['time']}:\n📚 {l['subject']}{room_str}{teacher_str}\n")
     return "\n".join(lines)
 
@@ -236,7 +248,7 @@ def format_full_week():
 
     today = datetime.now().date()
     start = today - timedelta(days=today.weekday())
-    weekdays = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб']
+    weekdays = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб"]
     result = "📆 Расписание на неделю:\n\n"
     for i, day in enumerate(weekdays):
         day_date = start + timedelta(days=i)
@@ -247,8 +259,8 @@ def format_full_week():
             result += "🌟 Нет занятий 🌟!\n\n"
         else:
             for l in lessons:
-                room_str = f" в {l['room']}" if l['room'] else ""
-                teacher_str = f"\n👨‍🏫 {l['teacher']}" if l['teacher'] else ""
+                room_str = f" в {l['room']}" if l.get("room") else ""
+                teacher_str = f"\n👨‍🏫 {l['teacher']}" if l.get("teacher") else ""
                 result += f"🕒 {l['time']}:\n📚 {l['subject']}{room_str}{teacher_str}\n"
             result += "\n"
     return result
@@ -260,7 +272,7 @@ dp = Dispatcher()
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
     await message.answer(
-        f"👋 Привет! Я бот расписания для группы {GROUP_VARIANTS[0]}.\n"
+        f"👋 Привет! Я бот расписания для группы {GROUP_NAME}.\n"
         f"Версия: {VERSION}\n\n"
         "Команды:\n"
         "/today – сегодня\n"
@@ -280,30 +292,28 @@ async def tomorrow_cmd(message: types.Message):
 async def week_cmd(message: types.Message):
     await message.answer(format_full_week())
 
-# ---------- Веб-сервер на aiohttp ----------
+# ---------- Веб-сервер (aiohttp) ----------
 async def handle_health(request):
     return web.Response(text=f"Bot is running. Version: {VERSION}")
 
 async def run_web_server():
     app = web.Application()
-    app.router.add_get('/', handle_health)
+    app.router.add_get("/", handle_health)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', 8080)
+    site = web.TCPSite(runner, "0.0.0.0", 8080)
     await site.start()
     logging.info("Web server started on port 8080")
 
-# ---------- Главная функция ----------
+# ---------- Главная ----------
 async def main():
     logging.basicConfig(level=logging.INFO)
-    # Загружаем расписание при старте
     try:
         get_cached_schedule()
-        logging.info("Расписание успешно загружено")
+        logging.info("Расписание успешно загружено при старте")
     except Exception as e:
-        logging.error(f"Критическая ошибка загрузки: {e}")
+        logging.error(f"Критическая ошибка при старте: {e}")
 
-    # Запускаем веб-сервер и бота параллельно
     await asyncio.gather(
         run_web_server(),
         dp.start_polling(bot)
