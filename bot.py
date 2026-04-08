@@ -3,7 +3,6 @@ import asyncio
 import logging
 import re
 import time
-import json
 from datetime import datetime, timedelta
 
 import aiohttp
@@ -13,18 +12,16 @@ from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 
-# ---------- Конфигурация ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не задан")
 
 API_URL = "https://para.alf-kai.ru/?q=24100"
 FALLBACK_URL = "https://alf-kai.ru/расписание/"
-GROUP_NAME = "24100 (09.03.03)"
-SEMESTER_START = datetime(2026, 2, 9)   # начало семестра (понедельник, нечётная неделя)
-VERSION = "2026-04-08-debug"
+GROUP_VARIANTS = ["24100", "09.03.03"]
+SEMESTER_START = datetime(2026, 2, 9)
+VERSION = "2026-04-08-improved-html"
 
-# ---------- Кэш ----------
 _cache = {"data": None, "expires": 0}
 
 def get_cached_schedule():
@@ -34,40 +31,30 @@ def get_cached_schedule():
         _cache["expires"] = now + 3600
     return _cache["data"]
 
-# ---------- Универсальная загрузка с диагностикой ----------
 def load_schedule():
-    """Пробует API, затем fallback HTML, с подробным логированием."""
-    # 1. Пробуем API
+    # Попытка через API
     try:
         resp = requests.get(API_URL, timeout=10)
         resp.raise_for_status()
-        content_type = resp.headers.get('content-type', '')
-        logging.info(f"API ответ: статус {resp.status_code}, Content-Type: {content_type}")
-        # Логируем первые 500 символов для анализа
-        logging.info(f"API фрагмент ответа: {resp.text[:500]}")
-
-        if 'application/json' in content_type:
+        if 'application/json' in resp.headers.get('content-type', ''):
             data = resp.json()
             return parse_api_json(data)
         else:
-            # Возможно, API вернул HTML (редирект или ошибка)
-            logging.warning("API вернул не JSON, пробуем распарсить как HTML")
+            logging.warning("API вернул HTML, пробуем парсить как HTML")
             return parse_html(resp.text)
     except Exception as e:
         logging.error(f"Ошибка API: {e}")
 
-    # 2. Fallback: прямой запрос к alf-kai.ru/расписание/
+    # Fallback на основную страницу
     try:
         resp = requests.get(FALLBACK_URL, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15)
         resp.raise_for_status()
-        logging.info(f"Fallback HTML ответ: статус {resp.status_code}, длина {len(resp.text)}")
         return parse_html(resp.text)
     except Exception as e:
         logging.error(f"Ошибка fallback: {e}")
         raise ValueError("Не удалось загрузить расписание ни через API, ни через HTML")
 
 def parse_api_json(data):
-    """Обработка JSON от API (если он всё же есть)."""
     day_map = {
         "Понедельник": "Пн", "Вторник": "Вт", "Среда": "Ср",
         "Четверг": "Чт", "Пятница": "Пт", "Суббота": "Сб", "Воскресенье": "Вс"
@@ -98,48 +85,66 @@ def parse_api_json(data):
     return schedule
 
 def parse_html(html):
-    """Парсинг HTML таблицы с расписанием."""
     soup = BeautifulSoup(html, 'html.parser')
     tables = soup.find_all('table')
     logging.info(f"Найдено таблиц: {len(tables)}")
     if not tables:
         raise ValueError("HTML не содержит таблиц")
 
-    # Ищем таблицу, в которой есть ячейки с днями недели
+    # Поиск целевой таблицы (предположительно, расписание - это большая таблица с днями)
+    # Выведем первые несколько строк каждой таблицы для диагностики
     target_table = None
-    for tbl in tables:
+    for i, tbl in enumerate(tables):
         rows = tbl.find_all('tr')
-        if not rows:
+        if len(rows) < 5:
             continue
-        # Проверяем первую строку на наличие дней недели или "24100"
+        # Посмотрим текст первой строки
         first_row_text = rows[0].get_text()
-        if any(day in first_row_text for day in ['Понедельник', 'Вторник', '24100']):
+        logging.info(f"Таблица {i}: первые 100 символов: {first_row_text[:100]}")
+        # Если есть дни недели или "24100", это наша таблица
+        if any(day in first_row_text for day in ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота']):
             target_table = tbl
             break
+        if any(variant in first_row_text for variant in GROUP_VARIANTS):
+            target_table = tbl
+            break
+
     if not target_table:
-        target_table = tables[0]  # берём первую попавшуюся
+        # Берём самую большую таблицу по числу строк
+        target_table = max(tables, key=lambda t: len(t.find_all('tr')), default=None)
+        if not target_table:
+            raise ValueError("Не найдена подходящая таблица")
+        logging.info("Используем самую большую таблицу")
 
     rows = target_table.find_all('tr')
     if len(rows) < 2:
         raise ValueError("В таблице недостаточно строк")
 
-    # Определяем колонку для группы 24100 (ищем в шапке)
-    header_cells = rows[0].find_all(['td', 'th'])
+    # Ищем колонку группы, сканируя первые несколько строк
     target_col = None
-    for idx, cell in enumerate(header_cells):
-        cell_text = cell.get_text(strip=True)
-        if '24100' in cell_text or '09.03.03' in cell_text:
-            target_col = idx
+    # Сначала в шапке (первые 3 строки)
+    for row in rows[:3]:
+        cells = row.find_all(['td', 'th'])
+        for idx, cell in enumerate(cells):
+            cell_text = cell.get_text(strip=True)
+            for variant in GROUP_VARIANTS:
+                if variant in cell_text:
+                    target_col = idx
+                    break
+            if target_col is not None:
+                break
+        if target_col is not None:
             break
+
     if target_col is None:
-        # Пытаемся найти колонку по умолчанию (обычно третья)
-        if len(header_cells) >= 3:
+        # По умолчанию третья колонка (индекс 2)
+        if len(rows[0].find_all(['td', 'th'])) >= 3:
             target_col = 2
             logging.warning(f"Колонка группы не найдена, используется индекс {target_col}")
         else:
             raise ValueError("Не удалось определить колонку группы")
 
-    logging.info(f"Используется колонка {target_col} из {len(header_cells)}")
+    logging.info(f"Используется колонка {target_col}")
 
     day_names = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота']
     day_short = {'Понедельник': 'Пн', 'Вторник': 'Вт', 'Среда': 'Ср',
@@ -154,7 +159,6 @@ def parse_html(html):
         if not cells:
             continue
 
-        # Обработка rowspan
         if rowspan_rem == 0:
             day_cell = cells[0]
             day_text = day_cell.get_text(strip=True)
@@ -163,7 +167,6 @@ def parse_html(html):
                     current_day = d
                     break
             if not current_day:
-                # Может быть, день в первой ячейке, но сокращённо? Пропускаем строки без дня
                 continue
             rowspan_rem = int(day_cell.get('rowspan', 1))
             time_idx = 1
@@ -231,13 +234,11 @@ def parse_lesson_text(text):
         text = text[:match.start()].strip()
     return text or "Без названия", teacher, room
 
-# ---------- Чётность недели ----------
 def get_week_parity(date):
     delta = date - SEMESTER_START.date()
     week_number = delta.days // 7 + 1
     return "нечётная" if week_number % 2 == 1 else "чётная"
 
-# ---------- Форматирование ----------
 def format_schedule_for_day(target_date):
     try:
         schedule = get_cached_schedule()
@@ -289,14 +290,14 @@ def format_full_week():
             result += "\n"
     return result
 
-# ---------- Telegram Bot ----------
+# Telegram Bot
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
     await message.answer(
-        f"👋 Привет! Я бот расписания для группы {GROUP_NAME}.\n"
+        f"👋 Привет! Я бот расписания для группы 24100 (09.03.03).\n"
         f"Версия: {VERSION}\n\n"
         "Команды:\n"
         "/today – сегодня\n"
@@ -316,7 +317,7 @@ async def tomorrow_cmd(message: types.Message):
 async def week_cmd(message: types.Message):
     await message.answer(format_full_week())
 
-# ---------- Веб-сервер (aiohttp) ----------
+# Web server
 async def handle_health(request):
     return web.Response(text=f"Bot is running. Version: {VERSION}")
 
@@ -329,7 +330,6 @@ async def run_web_server():
     await site.start()
     logging.info("Web server started on port 8080")
 
-# ---------- Главная ----------
 async def main():
     logging.basicConfig(level=logging.INFO)
     try:
